@@ -3,6 +3,7 @@ import json
 import numpy as np
 from dataclasses import dataclass
 from typing import Dict, List, Any, Optional
+import warnings
 
 @dataclass
 class Interval:
@@ -24,30 +25,46 @@ class DSpacesError(Exception):
     pass
 
 class DSpacesClient:
-    def __init__(self, base_url="http://localhost:8001"):
+    def __init__(self, base_url="http://localhost:8001", debug=False):
         self.base_url = base_url.rstrip('/')
         self.session = requests.Session()
-        # Element type mappings per schema
+        self.debug = debug
+        
+        # Only support floating point types
         self.type_map = {
             np.dtype('float32'): 6,
             np.dtype('float64'): 7,
-            np.dtype('int32'): 4,
-            np.dtype('int64'): 5,
         }
-        self.reverse_type_map = {v: k for k, v in self.type_map.items()}
         
+        # Server element sizes for floating point types
+        self.element_sizes = {
+            6: 4,  # float32
+            7: 8,  # float64
+        }
+        
+        self.reverse_type_map = {v: k for k, v in self.type_map.items()}
+
     def put_object(self, obj_name: str, obj_version: int, data: np.ndarray, 
                   box: BoundingBox, namespace: Optional[str] = None) -> None:
         """Store data to DataSpaces per schema"""
+        # Convert integer types to float32
+        if np.issubdtype(data.dtype, np.integer):
+            warnings.warn(f"Integer type {data.dtype} is not supported, converting to float32")
+            data = data.astype(np.float32)
+        
         if data.dtype not in self.type_map:
-            raise DSpacesError(f"Unsupported data type: {data.dtype}")
+            raise DSpacesError(f"Unsupported data type: {data.dtype}. "
+                             f"Supported types: {list(self.type_map.keys())}")
 
+        dtype_num = self.type_map[data.dtype]
         params = {
-            'element_size': data.itemsize,
-            'element_type': self.type_map[data.dtype],
+            'element_size': self.element_sizes[dtype_num],
+            'element_type': dtype_num,
         }
-        if namespace:
-            params['namespace'] = namespace
+        
+        if self.debug:
+            print(f"PUT Debug: dtype={data.dtype}, element_size={params['element_size']}, "
+                  f"shape={data.shape}, total_size={data.nbytes}")
 
         # Per schema: box should be form data, not a file
         form_data = {
@@ -103,7 +120,23 @@ class DSpacesClient:
         if dtype_num not in self.reverse_type_map:
             raise DSpacesError(f"Unsupported element type: {dtype_num}")
 
+        element_size = self.element_sizes[dtype_num]
         dims = [int(d) for d in response.headers['X-DS-Dims'].split(',')]
+        expected_size = np.prod(dims) * element_size
+
+        if self.debug:
+            print(f"GET Debug: dtype={self.reverse_type_map[dtype_num]}, "
+                  f"element_size={element_size}, dims={dims}, "
+                  f"content_size={len(response.content)}, "
+                  f"expected_size={expected_size}")
+
+        if len(response.content) != expected_size:
+            raise DSpacesError(
+                f"Data size mismatch: got {len(response.content)} bytes, "
+                f"expected {expected_size} bytes for shape {dims} "
+                f"and dtype {self.reverse_type_map[dtype_num]}"
+            )
+
         return np.frombuffer(response.content, 
                            dtype=self.reverse_type_map[dtype_num]).reshape(dims)
 
@@ -116,6 +149,10 @@ class DSpacesClient:
         params = {'namespace': namespace} if namespace else {}
         response = self._make_request('GET', f'/dspaces/var/{obj_name}', params=params)
         return [DSObject(**obj) for obj in response]
+
+    def delete_object(self, obj_name: str, obj_version: int) -> None:
+        """Delete an object from DSpaces"""
+        self._make_request('DELETE', f'/dspaces/obj/{obj_name}/{obj_version}')
 
     def _make_request(self, method: str, endpoint: str, return_raw=False, **kwargs) -> Any:
         """Handle HTTP requests and errors with improved error reporting"""
